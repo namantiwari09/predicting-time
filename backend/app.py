@@ -4,6 +4,7 @@ Handles:
   - Google Maps Distance Matrix API calls
   - ML model inference
   - CORS for React frontend
+  - Serving static frontend files
 """
 
 import os
@@ -11,11 +12,14 @@ import json
 import requests
 import joblib
 import numpy as np
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 
 # ── App Setup ────────────────────────────────────────────────────────────────
-app = Flask(__name__)
+# Configure Flask to serve static files from the frontend build directory
+FRONTEND_DIST = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist'))
+
+app = Flask(__name__, static_folder=FRONTEND_DIST, static_url_path='/')
 CORS(app)
 
 # ── Load ML Model ────────────────────────────────────────────────────────────
@@ -30,7 +34,6 @@ except Exception as exc:
     print(f"WARNING: Failed to load model ({exc}). Run train_model.py first.")
 
 # ── Google Maps API Key ──────────────────────────────────────────────────────
-# Set your API key as an environment variable: GOOGLE_MAPS_API_KEY
 GOOGLE_MAPS_API_KEY = os.environ.get('GOOGLE_MAPS_API_KEY', '')
 
 TRAFFIC_MAP = {
@@ -39,13 +42,7 @@ TRAFFIC_MAP = {
     'high': 3,
 }
 
-
 def get_distance_from_google_maps(origin: str, destination: str):
-    """
-    Call Google Maps Distance Matrix API to get distance (km) and
-    estimated travel duration (minutes) between two locations.
-    Returns (distance_km, duration_min, distance_text, duration_text) or raises.
-    """
     url = 'https://maps.googleapis.com/maps/api/distancematrix/json'
     params = {
         'origins': origin,
@@ -73,20 +70,12 @@ def get_distance_from_google_maps(origin: str, destination: str):
 
     return distance_km, duration_min, distance_text, duration_text
 
-
 def estimate_distance_fallback(origin: str, destination: str):
-    """
-    Fallback distance estimation when Google Maps API key is not set.
-    Uses a simple hash-based approach for demo purposes.
-    """
     combined = f"{origin.lower().strip()}{destination.lower().strip()}"
     hash_val = sum(ord(c) for c in combined)
-    # Generate a pseudo-random but deterministic distance between 1-20 km
     distance_km = round(1.0 + (hash_val % 190) / 10.0, 2)
-    # Estimate travel duration at ~25 km/h city speed
     duration_min = round((distance_km / 25.0) * 60.0, 1)
     return distance_km, duration_min, f"{distance_km} km", f"{int(duration_min)} mins"
-
 
 # ── Routes ───────────────────────────────────────────────────────────────────
 
@@ -98,53 +87,29 @@ def health():
         'google_maps_configured': bool(GOOGLE_MAPS_API_KEY),
     })
 
-
 @app.route('/api/predict', methods=['POST'])
 def predict():
-    """
-    Predict delivery time.
-    Expected JSON body:
-    {
-        "restaurant_location": "string",
-        "delivery_location": "string",
-        "prep_time": number (minutes),
-        "traffic_level": "low" | "medium" | "high"
-    }
-    """
     if model is None:
-        return jsonify({'error': 'ML model not loaded. Please run train_model.py first.'}), 500
+        return jsonify({'error': 'ML model not loaded.'}), 500
 
     data = request.get_json(force=True, silent=True)
     if not data:
         return jsonify({'error': 'Invalid JSON body.'}), 400
 
-    # ── Validate inputs ──────────────────────────────────────────────────
     restaurant = data.get('restaurant_location', '').strip()
     delivery = data.get('delivery_location', '').strip()
     prep_time = data.get('prep_time')
     traffic = data.get('traffic_level', '').lower().strip()
 
     errors = []
-    if not restaurant:
-        errors.append('Restaurant location is required.')
-    if not delivery:
-        errors.append('Delivery location is required.')
-    if prep_time is None:
-        errors.append('Preparation time is required.')
-    else:
-        try:
-            prep_time = float(prep_time)
-            if prep_time < 0 or prep_time > 120:
-                errors.append('Preparation time must be between 0 and 120 minutes.')
-        except (ValueError, TypeError):
-            errors.append('Preparation time must be a valid number.')
-    if traffic not in TRAFFIC_MAP:
-        errors.append('Traffic level must be low, medium, or high.')
+    if not restaurant: errors.append('Restaurant location is required.')
+    if not delivery: errors.append('Delivery location is required.')
+    if prep_time is None: errors.append('Prep time is required.')
+    if traffic not in TRAFFIC_MAP: errors.append('Invalid traffic level.')
 
     if errors:
         return jsonify({'error': ' '.join(errors)}), 400
 
-    # ── Get distance from Google Maps (or fallback) ──────────────────────
     try:
         if GOOGLE_MAPS_API_KEY:
             distance_km, gm_duration, dist_text, dur_text = get_distance_from_google_maps(restaurant, delivery)
@@ -155,14 +120,12 @@ def predict():
     except Exception as e:
         return jsonify({'error': f'Failed to get distance: {str(e)}'}), 502
 
-    # ── Prepare features & predict ───────────────────────────────────────
     traffic_num = TRAFFIC_MAP[traffic]
-    features = np.array([[distance_km, prep_time, traffic_num]])
+    features = np.array([[distance_km, float(prep_time), traffic_num]])
     predicted_time = float(model.predict(features)[0])
-    predicted_time = max(round(predicted_time, 1), 5.0)  # minimum 5 minutes
+    predicted_time = max(round(predicted_time, 1), 5.0)
 
-    # ── Build response ───────────────────────────────────────────────────
-    response = {
+    return jsonify({
         'predicted_time': predicted_time,
         'distance_km': distance_km,
         'distance_text': dist_text,
@@ -170,15 +133,19 @@ def predict():
         'travel_time_text': dur_text,
         'prep_time': prep_time,
         'traffic_level': traffic,
-        'traffic_numeric': traffic_num,
         'restaurant_location': restaurant,
         'delivery_location': delivery,
         'data_source': source,
-    }
+    })
 
-    return jsonify(response)
+# ── Frontend Routes ──────────────────────────────────────────────────────────
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve_frontend(path):
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+        return send_from_directory(app.static_folder, path)
+    else:
+        return send_from_directory(app.static_folder, 'index.html')
 
-
-# ── Run ──────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
